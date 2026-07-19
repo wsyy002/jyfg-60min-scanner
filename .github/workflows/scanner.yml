@@ -1,0 +1,41 @@
+name: JYFG 60min Scanner
+
+on:
+  schedule:
+    # 中国交易时段 60分K线收盘后运行 (北京时间)
+    # 60分K线收盘: 10:30 / 11:30 / 14:00 / 15:00
+    # UTC = CST - 8h
+    - cron: "31 2,3,6,7 * * 1-5"   # 2:31 / 3:31 / 6:01 / 7:01 UTC = 10:31/11:31/14:01/15:01 CST
+  workflow_dispatch:                # 支持手动触发
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run 60min scanner
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: python 60min_scanner_ga.py --force
+
+  # 如需本地 Self-Hosted Runner 下单模式，取消下方注释
+  # full-scan:
+  #   runs-on: self-hosted
+  #   if: github.event_name == 'schedule'
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Run full mode (with trading)
+  #       env:
+  #         FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+  #         JYFG_MODE: full
+  #       run: python 60min_scanner_ga.py --force
