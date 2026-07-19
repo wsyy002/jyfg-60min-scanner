@@ -17,6 +17,7 @@ import os, sys, json, time
 import requests
 import numpy as np
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BJT = timezone(timedelta(hours=8))
 now = datetime.now(BJT)
@@ -803,25 +804,48 @@ def scan_and_trade():
 
     trade_log = []
 
-    # ── 买入扫描 ──
-    buy_signals = []
-    for idx, s in enumerate(candidates):
+    # ═══ 并行扫描买入信号 ═══
+    # 预过滤候选
+    scan_targets = []
+    for s in candidates:
         if not check_listing(s['code']):
             continue
         if s['code'] in pos_map:
             continue
-        if s['change_pct'] >= 8:
+        if s['change_pct'] >= 8 or s['price'] <= 0:
             continue
-        if s['price'] <= 0:
-            continue
+        scan_targets.append(s)
+    log(f"预过滤后: {len(scan_targets)}只待扫描")
 
-        klines = get_60min_kline(s['code'])
+    # 并行拉取60分K线
+    kline_cache = {}
+    fetch_count = 0
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        fut_map = {
+            executor.submit(get_60min_kline, s['code']): s['code']
+            for s in scan_targets
+        }
+        for fut in as_completed(fut_map):
+            code = fut_map[fut]
+            try:
+                klines = fut.result()
+                if klines:
+                    kline_cache[code] = klines
+                fetch_count += 1
+                if fetch_count % 20 == 0:
+                    log(f"  K线数据拉取: {fetch_count}/{len(scan_targets)}")
+            except:
+                pass
+
+    log(f"K线数据就绪: {len(kline_cache)}/{len(scan_targets)}")
+
+    # 逐个计算指标
+    buy_signals = []
+    for s in scan_targets:
+        klines = kline_cache.get(s['code'])
         if not klines:
             continue
-
         ind = compute_jyfg_indicators(klines)
-
-        # 趋势过滤
         if not ind['uptrend'] and ind['score'] < 50:
             continue
         if not ind['has_buy']:
@@ -844,22 +868,19 @@ def scan_and_trade():
             f"评分{ind['score']} 价{s['price']:.2f} 涨{s['change_pct']:+.2f}%"
         )
 
-        # ── 自动买入（仅full模式） ──
+        # 自动买入（仅full模式）
         if IS_FULL and acct and tsvc:
             cur_hold = len(positions) + len(
                 [t for t in trade_log if t['action'] == '买入']
             )
             if cur_hold >= MAX_HOLDINGS:
-                log(f"⚠️ 已达最大持仓{MAX_HOLDINGS}只，跳过{s['name']}")
                 continue
-
             buy_ratio = get_buy_ratio(ind)
             qty = max(
                 int(acct['total_asset'] * buy_ratio / s['price'] / 100) * 100, 100
             )
             if qty < 100:
                 continue
-
             log(
                 f"🟢 [{ind['buy_type']}]买入 {s['name']}({s['code']}) "
                 f"评分{ind['score']} {s['price']:.2f}×{qty}={qty*s['price']:.0f} "
@@ -868,61 +889,60 @@ def scan_and_trade():
             result = place_buy_order(tsvc, s['code'], s['price'], qty)
             if result.get('success'):
                 trade_log.append({
-                    'action': '买入',
-                    'code': s['code'],
-                    'name': s['name'],
-                    'price': s['price'],
-                    'qty': qty,
-                    'amount': round(qty * s['price'], 2),
-                    'status': '成交',
-                    'buy_type': ind['buy_type'],
-                    'score': ind['score'],
+                    'action': '买入', 'code': s['code'], 'name': s['name'],
+                    'price': s['price'], 'qty': qty,
+                    'amount': round(qty * s['price'], 2), 'status': '成交',
+                    'buy_type': ind['buy_type'], 'score': ind['score'],
                     'stop_price': round(ind['stop_price'], 2),
                 })
                 log(f"  ✅ 委托{result.get('entrust_no','')}")
             else:
                 trade_log.append({
-                    'action': '买入',
-                    'code': s['code'],
-                    'name': s['name'],
-                    'price': s['price'],
-                    'qty': qty,
-                    'status': '失败',
+                    'action': '买入', 'code': s['code'], 'name': s['name'],
+                    'price': s['price'], 'qty': qty, 'status': '失败',
                     'error': result.get('error', ''),
                 })
                 log(f"  ❌ {result.get('error','')}")
 
-        if (idx + 1) % 30 == 0:
-            log(f"  进度{idx+1}/{len(candidates)}")
-
-    # ── 持仓扫描：卖出（仅full模式） ──
+    # ═══ 并行持仓扫描：卖出（仅full模式） ═══
     sell_details = []
-    if IS_FULL:
+    if IS_FULL and positions:
+        # 并行拉取持仓的60分K线
+        pos_klines = {}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            fut_map = {
+                executor.submit(get_60min_kline, p['code']): p['code']
+                for p in positions
+            }
+            for fut in as_completed(fut_map):
+                code = fut_map[fut]
+                try:
+                    k = fut.result()
+                    if k:
+                        pos_klines[code] = k
+                except:
+                    pass
+
         for pos in positions:
             code = pos['code']
-            klines = get_60min_kline(code)
+            klines = pos_klines.get(code)
             if not klines:
                 continue
-
             ind = compute_jyfg_indicators(klines)
             shares = pos['shares']
             if shares <= 0:
                 continue
-
-            # 获取实时卖一价
+            # 实时卖一价
             try:
                 pre = 'sh' if code.startswith('6') else 'sz'
                 r = requests.get(f"http://qt.gtimg.cn/q={pre}{code}", timeout=5)
                 f = r.text.split('~')
                 bid1 = (
-                    float(f[9])
-                    if len(f) > 9 and f[9] and float(f[9]) > 0
-                    else 0
+                    float(f[9]) if len(f) > 9 and f[9] and float(f[9]) > 0 else 0
                 )
                 cur_price = float(f[3]) if len(f) > 3 and f[3] else 0
             except:
                 bid1, cur_price = 0, 0
-
             sell_price = (
                 bid1 if bid1 > 0
                 else (cur_price if cur_price > 0 else pos.get('cost', 0))
@@ -947,34 +967,22 @@ def scan_and_trade():
                 sell_reason = f"评分降至{ind['score']}"
 
             if sell_action and tsvc:
-                log(
-                    f"{'🔴' if sell_action=='止损' else '🟡'} {sell_action} "
-                    f"{pos['name']}({code}) {shares}股 原因:{sell_reason} 评分{ind['score']}"
-                )
+                log(f"{'🔴' if sell_action=='止损' else '🟡'} {sell_action} "
+                    f"{pos['name']}({code}) {shares}股 原因:{sell_reason} 评分{ind['score']}")
                 result = place_sell_order(tsvc, code, sell_price, shares)
                 if result.get('success'):
                     trade_log.append({
-                        'action': sell_action,
-                        'code': code,
-                        'name': pos['name'],
-                        'price': sell_price,
-                        'qty': shares,
+                        'action': sell_action, 'code': code, 'name': pos['name'],
+                        'price': sell_price, 'qty': shares,
                         'amount': round(sell_price * shares, 2),
-                        'status': '成交',
-                        'reason': sell_reason,
+                        'status': '成交', 'reason': sell_reason,
                     })
-                    log(f"  ✅ 卖单{result.get('entrust_no','')}")
                 else:
                     trade_log.append({
-                        'action': sell_action,
-                        'code': code,
-                        'name': pos['name'],
-                        'price': sell_price,
-                        'qty': shares,
-                        'status': '失败',
-                        'error': result.get('error', ''),
+                        'action': sell_action, 'code': code, 'name': pos['name'],
+                        'price': sell_price, 'qty': shares,
+                        'status': '失败', 'error': result.get('error', ''),
                     })
-
                 sell_details.append(
                     f"{'🔴' if sell_action=='止损' else '🟡'} "
                     f"{pos['name']}({code}) {sell_action} "
