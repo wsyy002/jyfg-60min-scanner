@@ -2,7 +2,10 @@ name: JYFG 60min Scanner
 
 on:
   schedule:
-    - cron: "31 2,3,6,7 * * 1-5"
+    # 北京时间: 9:31 / 10:31 / 11:31 / 14:01
+    # UTC = CST - 8h
+    - cron: "31 1,2,3 * * 1-5"   # 9:31 / 10:31 / 11:31
+    - cron: "1 6 * * 1-5"        # 14:01
   workflow_dispatch:
 
 jobs:
