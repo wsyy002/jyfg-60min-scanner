@@ -3,7 +3,7 @@
 60分钟K线扫描器 v3.0 — JYFG波段引擎版
 GitHub Actions 适配版
 
-数据源: ① akshare(东方财富) → ② Sina(备用)
+数据源: ① Sina(腾讯行情) → ② akshare(东方财富, 境外慢)
 模式:
   - scan (默认): 仅扫描+飞书推送，GitHub云端Runner可用
   - full: 完整模式(含同花顺下单)，需Self-Hosted Runner
@@ -32,7 +32,13 @@ LOG_DIR = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 )
 os.makedirs(LOG_DIR, exist_ok=True)
-STOCK_LIST_CACHE = os.path.join(LOG_DIR, 'stock_list_cache.json')
+# 股票缓存：优先用仓库自带的（GA环境），否则用日志目录
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STOCK_LIST_CACHE = (
+    os.path.join(_SCRIPT_DIR, 'stock_list_cache.json')  # 仓库自带的缓存
+    if os.path.exists(os.path.join(_SCRIPT_DIR, 'stock_list_cache.json'))
+    else os.path.join(LOG_DIR, 'stock_list_cache.json')  # 运行时生成的缓存
+)
 
 # ─── 同花顺模拟交易配置（仅full模式） ──
 ACCOUNT = {
@@ -94,8 +100,16 @@ def log(msg):
 
 # ─── 数据源 ────────────────────────────────
 
-def get_akshare_spot():
-    """akshare 全市场实时行情"""
+def load_stock_list():
+    """加载股票列表：优先从仓库缓存读取，akshare为备选"""
+    if os.path.exists(STOCK_LIST_CACHE):
+        try:
+            with open(STOCK_LIST_CACHE, encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            log(f"读取缓存失败: {e}")
+
+    # 备选：akshare
     try:
         import akshare as ak
         df = ak.stock_zh_a_spot()
@@ -108,12 +122,13 @@ def get_akshare_spot():
             if c.startswith(('688', '689', '8', '4', '9')):
                 continue
             ci.append({'code': c, 'name': n})
+        # 写入缓存
+        os.makedirs(os.path.dirname(STOCK_LIST_CACHE), exist_ok=True)
+        with open(STOCK_LIST_CACHE, 'w', encoding='utf-8') as f:
+            json.dump(ci, f, ensure_ascii=False, indent=2)
         return ci
     except Exception as e:
         log(f"akshare spot 失败: {e}")
-        if os.path.exists(STOCK_LIST_CACHE):
-            with open(STOCK_LIST_CACHE) as f:
-                return json.load(f)
         return []
 
 
@@ -164,22 +179,8 @@ def enrich_tencent(stocks):
 
 
 def get_all_stocks():
-    """获取全市场股票列表"""
-    nr = True
-    if os.path.exists(STOCK_LIST_CACHE):
-        mtime = datetime.fromtimestamp(
-            os.path.getmtime(STOCK_LIST_CACHE), tz=BJT
-        ).strftime('%Y%m%d')
-        if mtime == now.strftime('%Y%m%d'):
-            nr = False
-    ci = get_akshare_spot() if nr else (
-        json.load(open(STOCK_LIST_CACHE))
-        if os.path.exists(STOCK_LIST_CACHE)
-        else []
-    )
-    if nr and ci:
-        with open(STOCK_LIST_CACHE, 'w') as f:
-            json.dump(ci, f, ensure_ascii=False)
+    """获取全市场股票列表（含实时行情）"""
+    ci = load_stock_list()
     if not ci:
         return []
     stocks = [
@@ -196,13 +197,37 @@ def get_all_stocks():
 def get_60min_kline(code):
     """
     获取60分钟K线数据
-    优先 akshare → Sina备用
-    支持两种来源统一返回格式
+    ① Sina（快，境外友好） → ② akshare（东方财富，慢）
     """
-    # ── ① akshare 东方财富接口 ──
+    # ── ① Sina 主数据源（快） ──
+    p = 'sh' if code.startswith('6') else 'sz'
+    try:
+        r = requests.get(
+            f"https://quotes.sina.com.cn/cn/api/jsonp_v2.php/var%20_{code}"
+            f"/CN_MarketData.getKLineData?symbol={p}{code}&scale=60&ma=no&datalen=80",
+            timeout=10,
+        )
+        t = r.text
+        if '(' in t:
+            d = json.loads(t[t.find('(') + 1:t.rfind(')')])
+            if d and len(d) >= 60:
+                return [
+                    {
+                        'time': b.get('day', b.get('date', '')),
+                        'open': float(b['open']),
+                        'high': float(b['high']),
+                        'low': float(b['low']),
+                        'close': float(b['close']),
+                        'volume': float(b.get('volume', 0)),
+                    }
+                    for b in d
+                ]
+    except:
+        pass
+
+    # ── ② akshare 备选 ──
     try:
         import akshare as ak
-        # 算日期范围：60分钟×80根≈20个交易日
         start = (now - timedelta(days=40)).strftime('%Y-%m-%d')
         end = now.strftime('%Y-%m-%d')
         df = ak.stock_zh_a_hist_min_em(
@@ -220,36 +245,10 @@ def get_60min_kline(code):
                     'volume': float(row['成交量']),
                 })
             return result
-    except Exception as e:
-        log(f"akshare 60min失败 ({code}): {str(e)[:60]}")
+    except Exception:
+        pass
 
-    # ── ② Sina 备用 ──
-    p = 'sh' if code.startswith('6') else 'sz'
-    try:
-        r = requests.get(
-            f"https://quotes.sina.com.cn/cn/api/jsonp_v2.php/var%20_{code}"
-            f"/CN_MarketData.getKLineData?symbol={p}{code}&scale=60&ma=no&datalen=80",
-            timeout=10,
-        )
-        t = r.text
-        if '(' not in t:
-            return None
-        d = json.loads(t[t.find('(') + 1:t.rfind(')')])
-        if not d or len(d) < 60:
-            return None
-        return [
-            {
-                'time': b.get('day', b.get('date', '')),
-                'open': float(b['open']),
-                'high': float(b['high']),
-                'low': float(b['low']),
-                'close': float(b['close']),
-                'volume': float(b.get('volume', 0)),
-            }
-            for b in d
-        ]
-    except:
-        return None
+    return None
 
 
 def check_listing(code):
